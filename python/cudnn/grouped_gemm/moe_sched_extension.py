@@ -169,8 +169,12 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
 
         elif cutlass.const_expr(tensor_name == "b"):
             # B: discrete — rewrite L to dynamic c1, expert-wise desc
-            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], shape[1], c1))
-            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("b", expert_idx))
+            real = rewrite_tensor_shape(
+                gmem_tensor_in_moe_view, (shape[0], shape[1], c1)
+            )
+            desc = tensormap_ptr_for_copy(
+                self.tensormap_ctor.get_desc_ptr("b", expert_idx)
+            )
             return (real, desc)
 
         elif cutlass.const_expr(tensor_name == "bias"):
@@ -179,7 +183,9 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "prob", "dprob")):
+        elif cutlass.const_expr(
+            tensor_name in ("c", "d", "d_col", "prob", "dprob", "global_scale")
+        ):
             # C/D/D_col/prob: contiguous M, offset by token_offset, global desc
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
@@ -193,7 +199,9 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             per_expert_shape = (tokens_i, shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             stride = gmem_tensor_in_moe_view.stride
-            real = cute.make_tensor(real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride)
+            )
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "sfd_col"):
@@ -202,11 +210,18 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sfd_col_layout = cute.tile_to_shape(
-                blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
+                blockscaled_utils.BlockScaledBasicChunk(
+                    self.sf_vec_size, OperandMajorMode.MN
+                ).layout,
                 per_expert_shape,
                 (1, 2, 3),
             )
-            real = cute.make_tensor(real.iterator, cute.make_layout(sfd_col_layout.shape, stride=gmem_tensor_in_moe_view.stride))
+            real = cute.make_tensor(
+                real.iterator,
+                cute.make_layout(
+                    sfd_col_layout.shape, stride=gmem_tensor_in_moe_view.stride
+                ),
+            )
             return (real, None)
 
         else:  # "sfb"
@@ -218,7 +233,9 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
                 gmem_tensor_in_moe_view.iterator,
                 cute.make_layout(sf_layout.shape, stride=stride),
             )
-            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("sfb", expert_idx))
+            desc = tensormap_ptr_for_copy(
+                self.tensormap_ctor.get_desc_ptr("sfb", expert_idx)
+            )
             return (real, desc)
 
 
@@ -297,7 +314,9 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], c1))
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "prob", "dprob")):
+        elif cutlass.const_expr(
+            tensor_name in ("c", "d", "d_col", "prob", "dprob", "global_scale")
+        ):
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
@@ -307,18 +326,27 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             per_expert_shape = (tokens_i, shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             stride = gmem_tensor_in_moe_view.stride
-            real = cute.make_tensor(real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride)
+            )
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "sfd_col"):
             real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sfd_col_layout = cute.tile_to_shape(
-                blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
+                blockscaled_utils.BlockScaledBasicChunk(
+                    self.sf_vec_size, OperandMajorMode.MN
+                ).layout,
                 per_expert_shape,
                 (1, 2, 3),
             )
-            real = cute.make_tensor(real.iterator, cute.make_layout(sfd_col_layout.shape, stride=gmem_tensor_in_moe_view.stride))
+            real = cute.make_tensor(
+                real.iterator,
+                cute.make_layout(
+                    sfd_col_layout.shape, stride=gmem_tensor_in_moe_view.stride
+                ),
+            )
             return (real, None)
 
         else:  # "sfb"
@@ -328,7 +356,9 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             per_expert_shape = (shape[0], shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             stride = gmem_tensor_in_moe_view.stride
-            real = cute.make_tensor(real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride)
+            )
             return (real, None)
 
 
@@ -387,15 +417,23 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
                 real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
                 return (real, None)
 
-            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], shape[1], c1))
-            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("c", expert_idx))
+            real = rewrite_tensor_shape(
+                gmem_tensor_in_moe_view, (shape[0], shape[1], c1)
+            )
+            desc = tensormap_ptr_for_copy(
+                self.tensormap_ctor.get_desc_ptr("c", expert_idx)
+            )
             return (real, desc)
 
         if cutlass.const_expr(tensor_name in ("sfa", "sfb")):
             per_expert_shape = (shape[0], tokens_i, c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             real = rewrite_tensor_shape(gmem_tensor_in_moe_view, sf_layout.shape)
-            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
+            desc = tensormap_ptr_for_copy(
+                self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx)
+            )
             return (real, desc)
 
-        raise ValueError(f"WgradScaledGemmSchedExtension: unknown tensor '{tensor_name}'")
+        raise ValueError(
+            f"WgradScaledGemmSchedExtension: unknown tensor '{tensor_name}'"
+        )
