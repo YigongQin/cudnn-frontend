@@ -16,8 +16,9 @@ Quantization: MXFP8 block scaling
   - Data dtype:  float8_e4m3fn
   - Scale dtype: float8_e8m0fnu
   - sf_vec_size: 32 (one scale per 32 elements in K)
-  - Global scale: alpha_tensor = ones (no per-token scaling)
-  - norm_const:   ones (no normalization)
+  - alpha_tensor: ones, shape (num_groups,) — per-expert, unused
+  - norm_const:   ones — unused
+  - No per-token global scale
 ```
 
 ### Target NVFP4 Per-Token Path
@@ -26,112 +27,152 @@ Quantization: NVFP4 block scaling with per-token global scale
   - Data dtype:  float4_e2m1fn_x2
   - Scale dtype: float8_e4m3fn
   - sf_vec_size: 16 (one scale per 16 elements in K)
-  - Global scale: alpha_tensor = per-token FP32 scale (shape: (num_groups,) or per-token)
-  - norm_const:   1 / (fp8_max * fp4_max) = 1 / (448 * 6) = 1/2688
+  - alpha_tensor: ones, shape (num_groups,) — per-expert, unchanged
+  - norm_const:   1 / (fp8_max * fp4_max) = 1/2688
+  - NEW: global_scale_tensor: FP32, shape (valid_m, 1, 1) — per-token global scale
 ```
 
 ### Key Difference
 MXFP8 uses `float8_e8m0fnu` scales (pure exponent, no mantissa) with sf_vec_size=32.
-NVFP4 uses `float8_e4m3fn` scales (has mantissa) with sf_vec_size=16, plus a **per-token FP32 global scale** that captures the dynamic range of each token's activation row. The cuDNN kernel's `alpha_tensor` parameter carries this per-token global scale.
+NVFP4 uses `float8_e4m3fn` scales (has mantissa) with sf_vec_size=16, plus a **per-token FP32 global scale** that captures the dynamic range of each token's activation row.
+
+---
+
+## Design Decision: New `global_scale_tensor` Parameter
+
+### Why not reuse `alpha_tensor`?
+- `alpha_tensor` is per-expert `(expert_cnt,)`, loaded once per expert tile via `alpha[expert_idx]`
+- Changing it to per-token would break every existing caller and waste memory for MXFP8 (broadcast ones to `(valid_m,)`)
+- Semantically different: alpha is a per-expert scaling knob, global_scale is a quantization artifact
+
+### Why not fold into `sfa_tensor`?
+- Would require multiplying FP32 global scale into FP8 E4M3 block scales during quantization
+- Loses FP32 precision — the whole point of a separate global scale is to preserve dynamic range
+
+### Chosen approach: New `global_scale_tensor` parameter
+
+Add a new optional parameter to both the kernel and the API wrapper:
+
+```python
+global_scale_tensor: Optional[torch.Tensor]  # shape: (valid_m, K // group_size, 1), dtype: float32
+```
+
+**Design for future generality:**
+- **Per-token (NVFP4 today):** shape `(valid_m, 1, 1)` — one FP32 scale per token row, broadcast across K
+- **Per-subchannel (future):** shape `(valid_m, K // group_size, 1)` — one FP32 scale per (token, channel_group) pair
+- **Per-tensor (degenerate):** shape `(1, 1, 1)` — broadcast everywhere
+- When `None` (default): no global scale applied, backward compatible with all existing callers
+
+**Kernel implementation:** Follows the same pattern as `prob_tensor`:
+- Shape `(valid_m, S, 1)` where S is the subchannel dimension (1 for per-token)
+- Indexed per-token via `mPosition` (same as prob), per-subchannel via the N-subtile index
+- Applied as FP32 multiply on accumulator, alongside `alpha_val`:
+  `acc = acc * alpha_val * global_scale[mPosition, subchannel_idx]`
 
 ---
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  TransformerEngine (forward_grouped_mlp.py)               │
-│                                                           │
-│  Input (BF16) ──► NVFP4 Quantize ──► grouped_gemm_glu   │
-│                   (per-token scale)    wrapper_sm100()    │
-│                                        sf_vec_size=16     │
-│                                        sf_dtype=e4m3fn    │
-│                                        alpha=per_token    │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  TransformerEngine (forward_grouped_mlp.py)                   │
+│                                                               │
+│  Input (BF16) ──► NVFP4 Quantize ──► grouped_gemm_glu       │
+│                   ├─ data (E2M1)      wrapper_sm100()        │
+│                   ├─ block_scale       sf_vec_size=16         │
+│                   │   (E4M3, per-16)   sf_dtype=e4m3fn       │
+│                   └─ global_scale      global_scale_tensor=  │
+│                       (FP32, per-row)   (valid_m, 1, 1)      │
+└──────────────────────────────────────────────────────────────┘
                           │
                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  cuDNN Frontend (grouped_gemm_glu/api.py)                 │
-│                                                           │
-│  Same kernel, different config:                           │
-│  - ab_dtype = float4_e2m1fn_x2                           │
-│  - sf_dtype = float8_e4m3fn (not e8m0fnu)                │
-│  - sf_vec_size = 16                                      │
-│  - alpha_tensor = per-token global scales                │
-│  - norm_const_tensor = 1/2688                            │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  cuDNN Frontend Kernel                                        │
+│                                                               │
+│  acc = SFA * A * SFB * B            (block-scaled GEMM)      │
+│  acc = acc * alpha[expert]          (per-expert, existing)   │
+│  acc = acc * global_scale[token,s]  (per-token, NEW)         │
+│  out = SwiGLU(acc) * prob[token]    (activation + gating)    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Phase 1: cuDNN Frontend Changes
 
-The cuDNN Frontend kernel **already supports** FP4 + sf_vec_size=16 + sf_dtype=float8_e4m3fn. The main work is verification and minor adjustments.
+### 1a. Kernel Modification — Add `global_scale_tensor`
 
-### Files to Verify / Modify
+| File | Change |
+|------|--------|
+| `python/cudnn/grouped_gemm/grouped_gemm_glu/moe_blockscaled_grouped_gemm_glu_bias.py` | **Modify kernel** to accept `global_scale` parameter. Load per-token via `mPosition` (same pattern as `prob`). Apply as FP32 multiply on accumulator between alpha and SwiGLU. When `None`/disabled, no-op (zero overhead). |
 
-| File | What | Action |
-|------|------|--------|
-| `python/cudnn/grouped_gemm/grouped_gemm_glu/api.py` | Unified GLU wrapper | **Verify** FP4+sf_vec_size=16+e4m3fn path works with per-token alpha. Check `alpha_tensor` shape flexibility (currently per-group; need per-token or confirm per-group suffices). |
-| `python/cudnn/grouped_gemm/grouped_gemm_glu/moe_blockscaled_grouped_gemm_glu_bias.py` | Kernel implementation | **Verify** how `alpha_tensor` is applied — is it per-expert or can it be per-token? If per-expert only, this is the main kernel change needed. |
-| `python/cudnn/grouped_gemm/grouped_gemm_quant/api.py` | FC2 quant wrapper | **Verify** same NVFP4 config works for FC2 path. |
-| `python/cudnn/grouped_gemm/moe_kernel_helpers.py` | Helper functions | **Verify** sf_vec_size=16 + FP4 + e4m3fn scale factor path. Line 538 has a check for FP8+sf_vec_size=16 but FP4+16 should pass. |
-| `python/cudnn/grouped_gemm/utils.py` | NVFP4 tensor shape util | **Verify** `logical_shape_for_fp4` (line 230) handles per-token shapes. |
+Kernel change (~20 lines):
+```python
+# In epilogue, after alpha multiply, before SwiGLU:
+if cutlass.const_expr(self.enable_global_scale):
+    gs_val = global_scale[mPosition, subchannel_idx, 0]
+    for i in cutlass.range_constexpr(cute.size(tTR_rAcc_gate)):
+        tTR_rAcc_gate[i] = tTR_rAcc_gate[i] * cutlass.Float32(gs_val)
+        tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(gs_val)
+```
 
-### Key Question: `alpha_tensor` Granularity
+### 1b. API Changes — Plumb `global_scale_tensor` Through
 
-**Current behavior:** `alpha_tensor` shape is `(num_groups,)` — one scalar per expert.
+| File | Change |
+|------|--------|
+| `python/cudnn/grouped_gemm/grouped_gemm_glu/api.py` | **Modify** `GroupedGemmGluSm100.__init__` and `grouped_gemm_glu_wrapper_sm100` to accept optional `global_scale_tensor`. Add shape validation: `(valid_m, S, 1)` where S >= 1. Pass to kernel. |
+| `python/cudnn/grouped_gemm/grouped_gemm_quant/api.py` | **Same change** for FC2 quant wrapper (`grouped_gemm_quant_wrapper_sm100`). |
 
-**Per-token NVFP4 requires:** One global scale per token (row of A), shape `(valid_m, 1)` or equivalent.
-
-**Investigation needed:** Read the kernel code to determine if `alpha_tensor` can be reshaped to per-token granularity, or if `norm_const_tensor` can absorb this. If neither works, the kernel needs a new parameter or the per-token scale must be folded into `sfa_tensor`.
-
-**Likely approach:** The NVFP4 hierarchical scaling `x = x_e2m1 * block_scale_e4m3 * global_scale_f32` can be achieved by:
-- `block_scale_e4m3` → goes into `sfa_tensor` (already per-block)
-- `global_scale_f32` → per-token, could be folded into `sfa_tensor` during quantization on the TE side, OR passed via a reshaped `alpha_tensor`/`prob_tensor`
-
-### New Test File
+### 1c. Verification — Existing FP4 Path
 
 | File | Action |
 |------|--------|
-| `test/python/fe_api/test_grouped_gemm_glu_nvfp4.py` | **Create** — dedicated NVFP4 per-token tests using the GLU wrapper with sf_vec_size=16, sf_dtype=e4m3fn, FP4 inputs, and non-trivial alpha_tensor values. |
+| `python/cudnn/grouped_gemm/moe_kernel_helpers.py` | **Verify** sf_vec_size=16 + FP4 + e4m3fn passes validation (line 538 only blocks FP8+16). |
+| `python/cudnn/grouped_gemm/utils.py` | **Verify** `logical_shape_for_fp4` (line 230) handles shapes correctly. |
+
+### 1d. New Tests
+
+| File | Action |
+|------|--------|
+| `test/python/fe_api/test_grouped_gemm_glu_nvfp4.py` | **Create** — NVFP4 tests with: (1) FP4 E2M1 inputs, sf_vec_size=16, E4M3 scales, (2) non-trivial per-token `global_scale_tensor` values, (3) numerical accuracy vs BF16 reference. Test both `global_scale_tensor=None` (backward compat) and per-token shapes. |
 
 ---
 
 ## Phase 2: TransformerEngine Changes
 
-### New Fused Op Class
+### 2a. New Fused Op Class
 
-| File | What | Action |
-|------|------|--------|
-| `transformer_engine/pytorch/ops/fused/forward_grouped_mlp.py` | Fused MLP ops | **Add** new class `ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4` modeled after `ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8`. Key differences: (1) NVFP4 quantization instead of MXFP8, (2) sf_vec_size=16, (3) e4m3fn scale dtype, (4) per-token global scale via alpha_tensor. |
+| File | Change |
+|------|--------|
+| `transformer_engine/pytorch/ops/fused/forward_grouped_mlp.py` | **Add** `ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4` (~200 lines), modeled after `_MXFP8` variant. Key differences: |
 
-### NVFP4 Quantization Integration
+Differences from MXFP8 class:
+1. Use `NVFP4Quantizer` instead of `MXFP8Quantizer` for input quantization
+2. `sf_vec_size = 16` (not 32)
+3. Scale dtype = `float8_e4m3fn` (not `float8_e8m0fnu`)
+4. Extract per-token `global_scale` from NVFP4 quantizer output, pass as `global_scale_tensor`
+5. Scale reshape: `(1, M//128, K//16//4, 32, 4, 4)` permuted to `(32, 4, M//128, 4, K//16//4, 1)`
+6. Gate behind env var `NVTE_CUTEDSL_FUSED_GROUPED_MLP_NVFP4` or recipe-based dispatch
 
-| File | What | Action |
-|------|------|--------|
-| `transformer_engine/pytorch/tensor/nvfp4_tensor.py` | NVFP4 tensor/quantizer | **Verify** `NVFP4Quantizer` produces the right scale layout. May need a helper to extract per-token global scale + per-block e4m3fn scales separately for the cuDNN kernel. |
-| `transformer_engine/pytorch/tensor/utils.py` | Tensor utilities | **Possibly modify** `group_quantize` path to support NVFP4 grouped quantization for activations. |
-| `transformer_engine/pytorch/csrc/extensions/cast.cpp` | C++ quantize extension | **Verify** `group_quantize_nvfp4_impl` exists and produces the right output format. |
+### 2b. NVFP4 Quantization Integration
 
-### Scale Factor Reshaping
+| File | Change |
+|------|--------|
+| `transformer_engine/pytorch/tensor/nvfp4_tensor.py` | **Verify / Minor** — ensure `NVFP4Quantizer` exposes per-token global scale separately from block scales. May need a property or helper to extract `global_scale` as a `(M, 1)` FP32 tensor. |
+| `transformer_engine/pytorch/tensor/utils.py` | **Verify** — `group_quantize` NVFP4 path produces cuDNN-compatible layout. |
+| `transformer_engine/pytorch/csrc/extensions/cast.cpp` | **Verify** — `group_quantize_nvfp4_impl` output format. |
 
-| File | What | Action |
-|------|------|--------|
-| `transformer_engine/pytorch/ops/fused/forward_grouped_mlp.py` | Scale reshape logic | **Add** NVFP4 scale reshaping in the new class. NVFP4 scales are `float8_e4m3fn` with sf_vec_size=16, so the reshape differs from MXFP8's `(1, M//128, K//128, 32, 4, 4)` layout. New layout: `(1, M//128, K//16//4, 32, 4, 4)` permuted to `(32, 4, M//128, 4, K//16//4, 1)`. Also extract per-token `global_scale` from `NVFP4Tensor.amax_rowwise` or equivalent. |
+### 2c. Routing and Registration
 
-### Routing and Registration
+| File | Change |
+|------|--------|
+| `transformer_engine/pytorch/ops/fused/__init__.py` | **Minor** — export new class. |
+| `transformer_engine/pytorch/module/grouped_linear.py` | **Minor** — select NVFP4 fused op when quantization recipe is `NVFP4BlockScaling`. |
+| `transformer_engine/pytorch/quantization.py` | **Verify** — `NVFP4BlockScalingRecipeState` compatibility. |
 
-| File | What | Action |
-|------|------|--------|
-| `transformer_engine/pytorch/ops/fused/forward_grouped_mlp.py` | Op registration | **Add** `ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4` to the list of candidate fused ops. Gate behind a new env var `NVTE_CUTEDSL_FUSED_GROUPED_MLP_NVFP4` or reuse the existing one with recipe-based dispatch. |
-| `transformer_engine/pytorch/ops/fused/__init__.py` | Exports | **Add** import for the new class. |
-| `transformer_engine/pytorch/quantization.py` | Recipe integration | **Verify** `NVFP4BlockScalingRecipeState` (line 1281) can produce quantizers compatible with the fused grouped MLP path. |
-| `transformer_engine/pytorch/module/grouped_linear.py` | GroupedLinear module | **Possibly modify** to select between MXFP8 and NVFP4 fused paths based on the quantization recipe. |
+### 2d. Backward Pass (Deferred)
 
-### Backward Pass (Not in Scope — Document for Future)
-
-The backward pass needs `grouped_gemm_dglu_wrapper_sm100` and `grouped_gemm_quant_wrapper_sm100` with NVFP4 config. This is deferred but the forward changes should not preclude it.
+Not in scope. The backward pass needs `grouped_gemm_dglu_wrapper_sm100` and `grouped_gemm_quant_wrapper_sm100` with NVFP4 config + `global_scale_tensor`. The forward changes should not preclude adding this later — the new parameter is optional throughout.
 
 ---
 
@@ -141,14 +182,15 @@ The backward pass needs `grouped_gemm_dglu_wrapper_sm100` and `grouped_gemm_quan
 
 | Test | Description |
 |------|-------------|
-| `test_grouped_gemm_glu_nvfp4.py` | NVFP4 FP4 forward with sf_vec_size=16, e4m3fn scales, per-token alpha_tensor. Both dense and discrete modes. Numerical accuracy vs BF16 reference. |
+| `test_grouped_gemm_glu_nvfp4.py` | FP4 forward with sf_vec_size=16, E4M3 scales, per-token global_scale_tensor. Dense mode. Accuracy vs BF16 reference. |
+| Existing tests | **Verify no regression** — all existing tests must pass with `global_scale_tensor=None`. |
 
 ### TransformerEngine Tests
 
 | Test | Description |
 |------|-------------|
-| Unit test in `test/pytorch/test_grouped_linear.py` | Add NVFP4 recipe variant to existing grouped linear tests. Verify forward pass produces correct output. |
-| Integration test | End-to-end MoE forward with NVFP4 quantization recipe, comparing against MXFP8 and BF16 baselines. |
+| `test/pytorch/test_grouped_linear.py` | Add NVFP4 recipe variant. Forward pass correctness. |
+| Integration | End-to-end MoE forward with NVFP4 recipe vs MXFP8 and BF16 baselines. |
 
 ---
 
@@ -158,42 +200,42 @@ The backward pass needs `grouped_gemm_dglu_wrapper_sm100` and `grouped_gemm_quan
 
 | File | Change Type | Description |
 |------|-------------|-------------|
-| `python/cudnn/grouped_gemm/grouped_gemm_glu/api.py` | Verify / Minor | Confirm FP4+sf_vec_size=16+e4m3fn config. Check alpha_tensor shape handling for per-token. |
-| `python/cudnn/grouped_gemm/grouped_gemm_glu/moe_blockscaled_grouped_gemm_glu_bias.py` | Verify / Possibly modify | Check how alpha is applied in the kernel. If per-expert only, need per-token support. |
-| `python/cudnn/grouped_gemm/grouped_gemm_quant/api.py` | Verify | FC2 path with same NVFP4 config. |
-| `python/cudnn/grouped_gemm/moe_kernel_helpers.py` | Verify | sf_vec_size=16 + FP4 validation. |
+| `grouped_gemm_glu/moe_blockscaled_grouped_gemm_glu_bias.py` | **Modify** | Add `global_scale` parameter to kernel. Per-token load + FP32 multiply on accumulator. ~20 lines. |
+| `grouped_gemm_glu/api.py` | **Modify** | Add `global_scale_tensor` to `GroupedGemmGluSm100` and `grouped_gemm_glu_wrapper_sm100`. Shape validation. ~40 lines. |
+| `grouped_gemm_quant/api.py` | **Modify** | Same `global_scale_tensor` plumbing for FC2 path. ~30 lines. |
 | `test/python/fe_api/test_grouped_gemm_glu_nvfp4.py` | **New** | NVFP4-specific test cases. |
 
 ### TransformerEngine (`TransformerEngine/`)
 
 | File | Change Type | Description |
 |------|-------------|-------------|
-| `transformer_engine/pytorch/ops/fused/forward_grouped_mlp.py` | **Major add** | New `ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4` class (~200 lines). |
+| `transformer_engine/pytorch/ops/fused/forward_grouped_mlp.py` | **Major add** | New `ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4` class. ~200 lines. |
 | `transformer_engine/pytorch/ops/fused/__init__.py` | Minor | Export new class. |
-| `transformer_engine/pytorch/ops/fused/backward_grouped_mlp.py` | No change | Backward not in scope. |
-| `transformer_engine/pytorch/tensor/nvfp4_tensor.py` | Verify / Minor | May need helper to split global scale from block scales. |
-| `transformer_engine/pytorch/tensor/utils.py` | Verify / Minor | Ensure NVFP4 grouped quantize produces cuDNN-compatible layout. |
-| `transformer_engine/pytorch/module/grouped_linear.py` | Minor | Route to NVFP4 fused op when recipe is NVFP4. |
-| `transformer_engine/pytorch/quantization.py` | Verify | NVFP4BlockScalingRecipeState compatibility. |
+| `transformer_engine/pytorch/tensor/nvfp4_tensor.py` | Verify / Minor | Expose per-token global scale. |
+| `transformer_engine/pytorch/tensor/utils.py` | Verify / Minor | NVFP4 grouped quantize layout. |
+| `transformer_engine/pytorch/module/grouped_linear.py` | Minor | Recipe-based fused op selection. |
+| `transformer_engine/pytorch/quantization.py` | Verify | Recipe state compatibility. |
 | `test/pytorch/test_grouped_linear.py` | Add cases | NVFP4 forward pass tests. |
 
 ---
 
 ## Execution Order
 
-1. **Investigate** alpha_tensor granularity in cuDNN kernel (is it per-expert or can it be per-token?)
-2. **Investigate** NVFP4 quantization output format in TE — how are global_scale and block_scales separated?
-3. **Write cuDNN test** (`test_grouped_gemm_glu_nvfp4.py`) with hardcoded NVFP4 tensors to validate the kernel config works
-4. **If kernel change needed:** modify cuDNN kernel to support per-token alpha
-5. **Write TE fused op** class `ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4`
-6. **Wire up** recipe-based dispatch in TE's GroupedLinear
-7. **End-to-end test** in TE
+1. **Add `global_scale_tensor` to cuDNN kernel** (`moe_blockscaled_grouped_gemm_glu_bias.py`) — per-token load following `prob` pattern, FP32 multiply on accumulator
+2. **Plumb through cuDNN API** (`grouped_gemm_glu/api.py`, `grouped_gemm_quant/api.py`) — optional parameter, `None` = no-op
+3. **Write cuDNN test** (`test_grouped_gemm_glu_nvfp4.py`) — validate FP4+sf_vec_size=16+e4m3fn+global_scale end-to-end
+4. **Run existing tests** — verify no regression with `global_scale_tensor=None`
+5. **Investigate TE NVFP4 quantizer output** — how to extract global_scale + block_scales + data
+6. **Write TE fused op** (`ForwardGroupedMLP_CuTeGEMMSwiGLU_NVFP4`)
+7. **Wire up** recipe-based dispatch in TE's GroupedLinear
+8. **End-to-end TE test**
 
 ---
 
 ## Open Questions
 
-1. **alpha_tensor shape:** Can the cuDNN kernel accept per-token (valid_m,) alpha instead of per-expert (num_groups,)? If not, can the per-token global scale be folded into sfa_tensor during quantization?
-2. **NVFP4 scale layout:** Does TE's `NVFP4Quantizer` output scales in the 6D `(32, 4, M//128, 4, K//16//4, 1)` layout cuDNN expects, or does it need reshaping?
-3. **norm_const_tensor:** For NVFP4 the normalization constant is `1/(fp8_max * fp4_max) = 1/2688`. Is this the right place to pass it, or should it be baked into the global scale?
-4. **Output quantization:** The FC1→FC2 handoff currently produces MXFP8 output (d_dtype=float8_e4m3fn). Should FC1 output also be NVFP4 (d_dtype=float4_e2m1fn_x2), or stay FP8 for FC2 input?
+1. **NVFP4 scale layout in TE:** Does `NVFP4Quantizer` output block scales in the 6D `(32, 4, M//128, 4, K//16//4, 1)` layout cuDNN expects, or does it need reshaping?
+2. **Global scale extraction:** How does TE's NVFP4 quantizer expose the per-token global scale? Is it a separate tensor or embedded in `scale_inv`?
+3. **norm_const_tensor:** For NVFP4 the normalization constant should be `1/(fp8_max * fp4_max) = 1/2688`. Confirm this is correct and where to pass it.
+4. **FC1→FC2 output dtype:** Currently MXFP8 produces `d_dtype=float8_e4m3fn` for FC2 input. Should NVFP4 path also produce FP8 output, or NVFP4 output with its own global_scale?
+5. **Subchannel dimension:** For the initial per-token implementation, `global_scale_tensor` shape is `(valid_m, 1, 1)`. Future subchannel support would use `(valid_m, K//group_size, 1)`. Does the kernel need to handle variable subchannel sizes at compile time or can it be dynamic?
